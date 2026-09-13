@@ -1,0 +1,12 @@
+# Build outputs
+/build/
+/build-cuda/
+
+# IDE and local validation artifacts
+.vs/
+.vscode/
+*.user
+*.suo
+examples/snake_dqn_ui/*.png
+examples/snake_dqn_ui/*-processes.json
+examples/snake_dqn_ui/*-pid.txt
