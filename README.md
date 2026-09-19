@@ -37,6 +37,12 @@ cmake --build build-cuda --config Release
 
 `hybrid_sgd_step` 在 CPU 参数上执行主机更新，在 CUDA 参数上调用 GPU SGD kernel；工程只针对单 GPU，不包含多 GPU 通信。
 
+当前 C++ API 已包含 `Tensor` 工厂函数、`add`/`matmul`/`add_bias`/`relu`/`mse_loss`、反向传播、`Linear`/`ReLU`/`Sequential`，以及带 momentum 的 `SGD` 和 `Adam`。CPU 回归测试通过 CTest 执行：
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+```
+
 ## DQN 贪吃蛇 UI
 
 进入目录并启动本地静态服务器：

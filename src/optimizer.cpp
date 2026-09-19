@@ -4,8 +4,12 @@ namespace mininn
     void sgd_step(const std::vector<TensorPtr> &ps, float lr)
     {
         for (auto &p : ps)
+        {
+            p->to_host();
             for (size_t i = 0; i < p->numel(); i++)
                 p->data[i] -= lr * p->grad[i];
+            p->to_device();
+        }
     }
     void hybrid_sgd_step(const std::vector<TensorPtr> &ps, float lr)
     {
