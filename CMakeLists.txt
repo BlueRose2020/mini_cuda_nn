@@ -31,4 +31,5 @@ target_link_libraries(
     CUDA::cudart
 )
 
+enable_testing()
 add_subdirectory(./tests)

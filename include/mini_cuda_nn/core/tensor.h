@@ -235,6 +235,7 @@ namespace mcn
         void *byte_ptr(size_t elem) const;
         size_t view_offset(size_t linear) const;
         bool is_contiguous() const;
+        Tensor make_view() const;
 
     private:
         bool require_grad_ = false;

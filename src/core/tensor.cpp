@@ -28,6 +28,41 @@ namespace
             return nullptr;
         return device == mcn::Device::CPU ? make_host_ptr(nbytes) : make_device_ptr(nbytes);
     }
+
+    std::vector<size_t> resolve_shape(const std::vector<int> &req, size_t numel, const char *who)
+    {
+        std::vector<size_t> out(req.size());
+        size_t infer = SIZE_MAX;
+        size_t known = 1;
+        for (size_t i = 0; i < req.size(); ++i)
+        {
+            if (req[i] == -1)
+            {
+                MCN_CHECK(infer == SIZE_MAX, "{}: only one -1 is allowed", who);
+                infer = i;
+            }
+            else
+            {
+                MCN_CHECK(req[i] >= 0, "{}: shape dim {} is negative", who, req[i]);
+                out[i] = static_cast<size_t>(req[i]);
+                known *= out[i];
+            }
+        }
+
+        if (infer != SIZE_MAX)
+        {
+            MCN_CHECK(known != 0 && numel % known == 0,
+                      "{}: cannot infer -1, numel={} is not divisible by {}", who, numel, known);
+            out[infer] = numel / known;
+        }
+        else
+        {
+            MCN_CHECK(known == numel,
+                      "{}: numel mismatch, requested {} but tensor has {}", who,
+                      mcn::format_shape(out), numel);
+        }
+        return out;
+    }
 }
 
 namespace mcn
@@ -286,24 +321,35 @@ namespace mcn
         return os;
     }
 
+    // --------------视图---------------
+    Tensor Tensor::make_view() const
+    {
+        Tensor v;
+        v.require_grad_ = require_grad_;
+        v.grad_ = nullptr; // 视图不继承计算图
+        v.grad_fn_ = nullptr;
+        v.data_ = data_;     // 共享存储（引用计数 +1）
+        v.offset_ = offset_; // 继承偏移，别写 0
+        v.size_ = size_;
+        v.shape_ = shape_;
+        v.strides_ = strides_;
+        v.device_ = device_;
+        v.dtype_ = dtype_;
+        return v;
+    }
+
     // --------------操作符重载---------------
     Tensor Tensor::operator[](size_t index) const
     {
         MCN_CHECK(!shape_.empty(), "operator[] on a 0-dim tensor");
         MCN_CHECK(shape_[0] && index < shape_[0], "index {} out of range for dim 0 of size {}", index, shape_[0]);
 
-        Tensor view;
-        view.require_grad_ = require_grad_;
-        view.grad_ = nullptr;
-        view.grad_fn_ = nullptr;
-        view.data_ = data_;
-        view.offset_ = offset_ + index * strides_[0];
-        view.size_ = size_ / shape_[0];
-        view.shape_.assign(shape_.begin() + 1, shape_.end());
-        view.strides_.assign(strides_.begin() + 1, strides_.end());
-        view.device_ = device_;
-        view.dtype_ = dtype_;
-        return view;
+        Tensor v = make_view();
+        v.offset_ += index * strides_[0];
+        v.size_ = size_ / shape_[0];
+        v.shape_.erase(v.shape_.begin());
+        v.strides_.erase(v.strides_.begin());
+        return v;
     }
 
     Tensor Tensor::clone() const
@@ -331,5 +377,27 @@ namespace mcn
         offset_ = 0;
         device_ = device;
         calculate_strides();
+    }
+
+    Tensor Tensor::view(const std::vector<int> &new_shape) const
+    {
+        std::vector<size_t> shp = resolve_shape(new_shape, size_, "view");
+        MCN_CHECK(is_contiguous(), "view() requires a contiguous tensor; use reshape() instead");
+
+        Tensor v = make_view();
+        v.shape_ = std::move(shp);
+        v.calculate_strides(); // 连续布局重算 strides_
+        return v;
+    }
+
+    Tensor Tensor::reshape(const std::vector<int> &new_shape) const
+    {
+        std::vector<size_t> shp = resolve_shape(new_shape, size_, "reshape");
+
+        // 不连续时先物化成连续副本，再在此基础上改形状
+        Tensor v = is_contiguous() ? make_view() : clone().make_view();
+        v.shape_ = std::move(shp);
+        v.calculate_strides();
+        return v;
     }
 }

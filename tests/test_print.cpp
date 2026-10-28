@@ -33,5 +33,19 @@ int main()
     std::cout << t4[1][0] << std::endl; // 期望 1（0 维标量）
     std::cout << t4[1].clone() << std::endl; // 期望与 t4[1] 相同
 
+    // reshape / view 验证
+    std::cout << "--- reshape ---" << std::endl;
+    mcn::Tensor a({1.f, 2.f, 3.f, 4.f, 5.f, 6.f}); // shape=[6]
+    std::cout << a.view({2, 3}) << std::endl;      // [[1, 2, 3], [4, 5, 6]]
+    std::cout << a.view({3, 2}) << std::endl;      // [[1, 2], [3, 4], [5, 6]]
+    std::cout << a.reshape({2, -1}) << std::endl;  // -1 推断成 3
+    std::cout << t4[1].view({1, 2}) << std::endl;  // 关键：带 offset_ 的视图，期望 [[1, 2]]
+
+    // view 必须与源共享存储：改一个另一个也变
+    mcn::Tensor src({1.f, 2.f, 3.f, 4.f});
+    mcn::Tensor vw = src.view({2, 2});
+    static_cast<float *>(vw.data_ptr())[0] = 99.f;
+    std::cout << src << "  <- 应与 view 共享，首元素为 99" << std::endl;
+
     return 0;
 }
