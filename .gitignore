@@ -1,2 +1,10 @@
 .vscode
-build
+
+# 构建输出
+/build*/
+/examples/build/
+
+# 个人试验程序：只保留目录内的构建脚本，草稿不进版本库。
+# 想提交某个 example 时用 git add -f examples/xxx.cpp
+examples/*
+!examples/CMakeLists.txt

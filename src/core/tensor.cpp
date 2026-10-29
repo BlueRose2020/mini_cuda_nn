@@ -1,7 +1,12 @@
 #include "mini_cuda_nn/core/tensor.h"
 #include "mini_cuda_nn/core/cuda_check.h"
+#include "mini_cuda_nn/core/dtype_dispatch.h"
+#include "mini_cuda_nn/core/kernel_launch.h"
 
+#include <algorithm>
 #include <cstring>
+#include <random>
+#include <type_traits>
 
 namespace
 {
@@ -63,6 +68,77 @@ namespace
         }
         return out;
     }
+
+    // ---- 主机端逐元素算子 ----
+    template <typename T>
+    void host_fill(void *dst, double value, size_t n)
+    {
+        std::fill_n(static_cast<T *>(dst), n, static_cast<T>(value));
+    }
+
+    template <typename T>
+    void host_add(void *dst, const void *src, size_t n)
+    {
+        T *d = static_cast<T *>(dst);
+        const T *s = static_cast<const T *>(src);
+        if constexpr (std::is_same_v<T, bool>)
+        {
+            for (size_t i = 0; i < n; ++i)
+                d[i] = d[i] || s[i];
+        }
+        else
+        {
+            for (size_t i = 0; i < n; ++i)
+                d[i] += s[i];
+        }
+    }
+
+    template <typename T>
+    void host_binary(mcn::detail::BinaryOp op, void *dst, const void *a, const void *b, size_t n)
+    {
+        T *d = static_cast<T *>(dst);
+        const T *x = static_cast<const T *>(a);
+        const T *y = static_cast<const T *>(b);
+        switch (op)
+        {
+        case mcn::detail::BinaryOp::Add:
+            for (size_t i = 0; i < n; ++i)
+                d[i] = x[i] + y[i];
+            break;
+        case mcn::detail::BinaryOp::Sub:
+            for (size_t i = 0; i < n; ++i)
+                d[i] = x[i] - y[i];
+            break;
+        case mcn::detail::BinaryOp::Mul:
+            for (size_t i = 0; i < n; ++i)
+                d[i] = x[i] * y[i];
+            break;
+        }
+    }
+
+    // 行优先矩阵乘法 out[M,N] = a[M,K] @ b[K,N]
+    // 用 i-k-j 循环顺序：内层遍历 j 时 b 的行和 out 的行都是连续访问，
+    // 比 i-j-k（内层每次跳 K 个元素）对缓存友好得多。
+    template <typename T>
+    void host_matmul(void *out, const void *a, const void *b, size_t M, size_t K, size_t N)
+    {
+        T *o = static_cast<T *>(out);
+        const T *x = static_cast<const T *>(a);
+        const T *y = static_cast<const T *>(b);
+
+        std::fill_n(o, M * N, T(0));
+        for (size_t i = 0; i < M; ++i)
+        {
+            T *orow = o + i * N;
+            for (size_t k = 0; k < K; ++k)
+            {
+                const T aik = x[i * K + k];
+                const T *yrow = y + k * N;
+                for (size_t j = 0; j < N; ++j)
+                    orow[j] += aik * yrow[j];
+            }
+        }
+    }
 }
 
 namespace mcn
@@ -123,6 +199,50 @@ namespace mcn
         result.calculate_size();
         result.allocate_memory();
         return result;
+    }
+
+    Tensor Tensor::zeros(const std::vector<size_t> &shape, Device device, DataType dtype, bool require_grad)
+    {
+        Tensor t = empty(shape, device, dtype, require_grad);
+        t.fill_(0.0);
+        return t;
+    }
+
+    Tensor Tensor::ones(const std::vector<size_t> &shape, Device device, DataType dtype, bool require_grad)
+    {
+        Tensor t = empty(shape, device, dtype, require_grad);
+        t.fill_(1.0);
+        return t;
+    }
+
+    Tensor Tensor::randn(const std::vector<size_t> &shape, Device device, DataType dtype, bool require_grad)
+    {
+        MCN_CHECK(is_floating_point(dtype), "randn: requires a floating point dtype, got {}", dtype_to_string(dtype));
+
+        // 先在本机生成，再按需搬到设备
+        Tensor t = empty(shape, Device::CPU, dtype, require_grad);
+        if (t.size_ != 0)
+        {
+            static thread_local std::mt19937 gen{std::random_device{}()};
+            std::normal_distribution<double> dist(0.0, 1.0);
+
+            if (dtype == DataType::FLOAT32)
+            {
+                float *p = static_cast<float *>(t.byte_ptr(0));
+                for (size_t i = 0; i < t.size_; ++i)
+                    p[i] = static_cast<float>(dist(gen));
+            }
+            else
+            {
+                double *p = static_cast<double *>(t.byte_ptr(0));
+                for (size_t i = 0; i < t.size_; ++i)
+                    p[i] = dist(gen);
+            }
+        }
+
+        if (device != Device::CPU)
+            t.to_(device);
+        return t;
     }
 
     // --------------元数据---------------
@@ -357,12 +477,100 @@ namespace mcn
         return Tensor(*this);
     }
 
-    void Tensor::to(Device device)
+    // --------------原地操作---------------
+    void Tensor::check_inplace(const char *who) const
+    {
+        MCN_CHECK(is_contiguous(), "{}: requires a contiguous tensor", who);
+        MCN_CHECK(grad_fn_ == nullptr,
+                  "{}: cannot modify a tensor that is part of an autograd graph in place", who);
+    }
+
+    Tensor &Tensor::fill_(double value)
+    {
+        check_inplace("fill_");
+        if (size_ == 0)
+            return *this;
+
+        void *dst = byte_ptr(0);
+        if (device_ != Device::CPU)
+        {
+            detail::launch_fill(dst, value, size_, dtype_);
+            return *this;
+        }
+
+        detail::dispatch_dtype(dtype_, [&]<typename T>()
+                               { host_fill<T>(dst, value, size_); });
+        return *this;
+    }
+
+    Tensor &Tensor::zero_()
+    {
+        return fill_(0.0);
+    }
+
+    Tensor &Tensor::copy_(const Tensor &src)
+    {
+        check_inplace("copy_");
+        MCN_CHECK(shape_ == src.shape_, "copy_: shape mismatch {} vs {}",
+                  format_shape(shape_), format_shape(src.shape_));
+        MCN_CHECK(dtype_ == src.dtype_, "copy_: dtype mismatch {} vs {}",
+                  dtype_to_string(dtype_), dtype_to_string(src.dtype_));
+        MCN_CHECK(src.is_contiguous(), "copy_: source must be contiguous");
+
+        if (size_ == 0)
+            return *this;
+
+        void *dst = byte_ptr(0);
+        const void *s = src.byte_ptr(0);
+        const size_t nbytes = size_ * itemsize(dtype_);
+
+        if (dst == s)
+            return *this;
+
+        if (device_ == Device::CPU && src.device_ == Device::CPU)
+            std::memmove(dst, s, nbytes);
+        else if (device_ == Device::CUDA && src.device_ == Device::CUDA)
+            CUDA_CHECK(cudaMemcpy(dst, s, nbytes, cudaMemcpyDeviceToDevice));
+        else if (device_ == Device::CUDA)
+            CUDA_CHECK(cudaMemcpy(dst, s, nbytes, cudaMemcpyHostToDevice));
+        else
+            CUDA_CHECK(cudaMemcpy(dst, s, nbytes, cudaMemcpyDeviceToHost));
+        return *this;
+    }
+
+    Tensor &Tensor::add_(const Tensor &other)
+    {
+        check_inplace("add_");
+        MCN_CHECK(shape_ == other.shape_, "add_: shape mismatch {} vs {}",
+                  format_shape(shape_), format_shape(other.shape_));
+        MCN_CHECK(dtype_ == other.dtype_, "add_: dtype mismatch {} vs {}",
+                  dtype_to_string(dtype_), dtype_to_string(other.dtype_));
+        MCN_CHECK(device_ == other.device_, "add_: device mismatch");
+        MCN_CHECK(other.is_contiguous(), "add_: other must be contiguous");
+
+        if (size_ == 0)
+            return *this;
+
+        void *dst = byte_ptr(0);
+        const void *s = other.byte_ptr(0);
+        if (device_ != Device::CPU)
+        {
+            // 原地累加 = binary_add 且输出与第一个输入别名（读改写同一元素，无跨线程依赖）
+            detail::launch_binary(detail::BinaryOp::Add, dst, dst, s, size_, dtype_);
+            return *this;
+        }
+
+        detail::dispatch_dtype(dtype_, [&]<typename T>()
+                               { host_add<T>(dst, s, size_); });
+        return *this;
+    }
+
+    Tensor &Tensor::to_(Device device)
     {
         if (device == device_)
-            return;
+            return *this;
 
-        MCN_CHECK(is_contiguous(), "to() requires a contiguous tensor; clone() it first");
+        MCN_CHECK(is_contiguous(), "to_: requires a contiguous tensor; clone() it first");
         const size_t nbytes = size_ * itemsize(dtype_);
         std::shared_ptr<void> new_data = make_buffer(nbytes, device);
         if (nbytes != 0)
@@ -377,6 +585,14 @@ namespace mcn
         offset_ = 0;
         device_ = device;
         calculate_strides();
+        return *this;
+    }
+
+    Tensor Tensor::to(Device device) const
+    {
+        Tensor copy = clone();
+        copy.to_(device);
+        return copy;
     }
 
     Tensor Tensor::view(const std::vector<int> &new_shape) const
@@ -399,5 +615,153 @@ namespace mcn
         v.shape_ = std::move(shp);
         v.calculate_strides();
         return v;
+    }
+
+    Tensor Tensor::transpose(int dim0, int dim1) const
+    {
+        const int nd = static_cast<int>(ndim());
+        MCN_CHECK(nd >= 2, "transpose: requires at least 2 dims, got {}", format_shape(shape_));
+
+        const int d0 = dim0 < 0 ? dim0 + nd : dim0;
+        const int d1 = dim1 < 0 ? dim1 + nd : dim1;
+        MCN_CHECK(d0 >= 0 && d0 < nd, "transpose: dim0 {} out of range for {}", dim0, format_shape(shape_));
+        MCN_CHECK(d1 >= 0 && d1 < nd, "transpose: dim1 {} out of range for {}", dim1, format_shape(shape_));
+
+        Tensor v = make_view();
+        std::swap(v.shape_[d0], v.shape_[d1]);
+        std::swap(v.strides_[d0], v.strides_[d1]);
+        return v;
+    }
+
+    Tensor Tensor::t() const
+    {
+        MCN_CHECK(ndim() == 2, "t(): requires a 2-D tensor, got {}", format_shape(shape_));
+        return transpose(0, 1);
+    }
+
+    Tensor Tensor::contiguous() const
+    {
+        return is_contiguous() ? make_view() : clone();
+    }
+
+    Tensor Tensor::binary_op(const Tensor &other, detail::BinaryOp op) const
+    {
+        MCN_CHECK(shape_ == other.shape_,
+                  "{}: shape mismatch {} vs {}", op_name(op),
+                  format_shape(shape_), format_shape(other.shape_));
+        MCN_CHECK(device_ == other.device_, "{}: device mismatch", op_name(op));
+        MCN_CHECK(dtype_ == other.dtype_, "{}: dtype mismatch {} vs {}", op_name(op),
+                  dtype_to_string(dtype_), dtype_to_string(other.dtype_));
+        MCN_CHECK(is_contiguous() && other.is_contiguous(),
+                  "{}: requires contiguous tensors", op_name(op));
+
+        Tensor out = empty(shape_, device_, dtype_, require_grad_ || other.require_grad_);
+        if (size_ == 0)
+            return out;
+
+        if (device_ == Device::CPU)
+            detail::dispatch_dtype(dtype_, [&]<typename T>()
+                                   { host_binary<T>(op, out.byte_ptr(0), byte_ptr(0), other.byte_ptr(0), size_); });
+        else
+            detail::launch_binary(op, out.byte_ptr(0), byte_ptr(0), other.byte_ptr(0), size_, dtype_);
+        return out;
+    }
+
+    constexpr const char *Tensor::op_name(detail::BinaryOp op)
+    {
+        switch (op)
+        {
+        case detail::BinaryOp::Add:
+            return "add";
+        case detail::BinaryOp::Sub:
+            return "sub";
+        case detail::BinaryOp::Mul:
+            return "mul";
+        }
+        return "binary_op";
+    }
+
+    Tensor Tensor::operator+(const Tensor &other) const
+    {
+        return binary_op(other, detail::BinaryOp::Add);
+    }
+
+    Tensor Tensor::operator-(const Tensor &other) const
+    {
+        return binary_op(other, detail::BinaryOp::Sub);
+    }
+
+    Tensor Tensor::operator*(const Tensor &other) const
+    {
+        return binary_op(other, detail::BinaryOp::Mul);
+    }
+
+    Tensor Tensor::matmul(const Tensor &other) const
+    {
+        MCN_CHECK(!shape_.empty() && ndim() <= 2,
+                  "matmul: lhs must be 1-D or 2-D, got {}", format_shape(shape_));
+        MCN_CHECK(!other.shape_.empty() && other.ndim() <= 2,
+                  "matmul: rhs must be 1-D or 2-D, got {}", format_shape(other.shape_));
+        MCN_CHECK(device_ == other.device_, "matmul: device mismatch");
+        MCN_CHECK(dtype_ == other.dtype_, "matmul: dtype mismatch {} vs {}",
+                  dtype_to_string(dtype_), dtype_to_string(other.dtype_));
+        MCN_CHECK(is_floating_point(dtype_), "matmul: requires a floating point dtype, got {}",
+                  dtype_to_string(dtype_));
+
+        // 非连续输入（例如 a.t()）自动物化；已连续时不产生拷贝
+        const bool lhs_cloned = !is_contiguous();
+        const bool rhs_cloned = !other.is_contiguous();
+        const Tensor lhs_c = contiguous();
+        const Tensor rhs_c = other.contiguous();
+
+        // 1-D 张量按 PyTorch 语义处理：
+        //   [K] @ [K,N] -> [N]
+        //   [M,K] @ [K] -> [M]
+        //   [K] @ [K]   -> 0 维标量
+        const bool lhs_1d = (ndim() == 1);
+        const bool rhs_1d = (other.ndim() == 1);
+
+        const size_t M = lhs_1d ? 1 : shape_[0];
+        const size_t K = lhs_1d ? shape_[0] : shape_[1];
+        const size_t K2 = other.shape_[0];
+        const size_t N = rhs_1d ? 1 : other.shape_[1];
+        MCN_CHECK(K == K2, "matmul: inner dimensions do not match, {} vs {}",
+                  format_shape(shape_), format_shape(other.shape_));
+
+        std::vector<size_t> out_shape;
+        if (lhs_1d && rhs_1d)
+            out_shape = {};
+        else if (lhs_1d)
+            out_shape = {N};
+        else if (rhs_1d)
+            out_shape = {M};
+        else
+            out_shape = {M, N};
+
+        Tensor out = empty(out_shape, device_, dtype_, require_grad_ || other.require_grad_);
+        if (out.size_ == 0)
+            return out;
+
+        void *dst = out.byte_ptr(0);
+        const void *lhs = lhs_c.data_ptr();
+        const void *rhs = rhs_c.data_ptr();
+
+        if (device_ == Device::CPU)
+        {
+            // matmul 只支持浮点（上面已校验），bool 分支不实例化，避免 bool 算术告警
+            detail::dispatch_dtype(dtype_, [&]<typename T>()
+                                   {
+                                       if constexpr (!std::is_same_v<T, bool>)
+                                           host_matmul<T>(dst, lhs, rhs, M, K, N); });
+        }
+        else
+        {
+            detail::launch_matmul(dst, lhs, rhs, M, K, N, dtype_);
+            // kernel 是异步的；若上面 clone 出了临时 device buffer，
+            // 它会在函数返回时释放，必须先等 kernel 读完
+            if (lhs_cloned || rhs_cloned)
+                CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        return out;
     }
 }

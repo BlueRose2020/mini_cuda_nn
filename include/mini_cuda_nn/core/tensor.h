@@ -6,23 +6,29 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ostream>
+#include <type_traits>
 
 #include "device.h"
 #include "dtype.h"
 #include "mini_cuda_nn/autograd/grad_fn.h"
 #include "mini_cuda_nn/core/cuda_check.h"
+#include "mini_cuda_nn/core/kernel_launch.h"
 
 #define MCN_UNUSED_EXPRESSION [[nodiscard("expression result is unused - did you forget to use the returned Tensor?")]]
 #define MCN_UNUSED_RETURN(func) [[nodiscard("result of " #func " is unused")]]
-#define MCN_CHECK(cond, ...)                                  \
-    do {                                                      \
-        if (!(cond)) {                                        \
-            std::fputs(std::format("MCN check failed: {} at {}:{}\n",  \
-                                   #cond, __FILE__, __LINE__).c_str(), stderr); \
-            std::fputs(std::format(__VA_ARGS__).c_str(), stderr);   \
-            std::fputc('\n', stderr);                         \
-            std::abort();                                     \
-        }                                                     \
+#define MCN_CHECK(cond, ...)                                          \
+    do                                                                \
+    {                                                                 \
+        if (!(cond))                                                  \
+        {                                                             \
+            std::fputs(std::format("MCN check failed: {} at {}:{}\n", \
+                                   #cond, __FILE__, __LINE__)         \
+                           .c_str(),                                  \
+                       stderr);                                       \
+            std::fputs(std::format(__VA_ARGS__).c_str(), stderr);     \
+            std::fputc('\n', stderr);                                 \
+            std::abort();                                             \
+        }                                                             \
     } while (0)
 
 namespace mcn
@@ -171,9 +177,15 @@ namespace mcn
         MCN_UNUSED_EXPRESSION
         Tensor operator*(const Tensor &other) const;
         template <typename T>
+            requires std::is_arithmetic_v<T>
         MCN_UNUSED_EXPRESSION
             Tensor
             operator*(const T &scalar) const;
+
+        // 矩阵乘法：2D @ 2D、1D @ 2D、2D @ 1D、1D @ 1D
+        MCN_UNUSED_RETURN(matmul)
+        Tensor matmul(const Tensor &other) const;
+
         friend std::ostream &operator<<(std::ostream &os, const Tensor &tensor);
         // template <typename T>
         // MCN_UNUSED_EXPRESSION
@@ -203,6 +215,12 @@ namespace mcn
         Tensor reshape(const std::vector<int> &new_shape) const;
         MCN_UNUSED_RETURN(view)
         Tensor view(const std::vector<int> &new_shape) const;
+        MCN_UNUSED_RETURN(transpose)
+        Tensor transpose(int dim0, int dim1) const;
+        MCN_UNUSED_RETURN(t)
+        Tensor t() const;
+        MCN_UNUSED_RETURN(contiguous)
+        Tensor contiguous() const;
 
         // 属性访问
         std::vector<size_t> shape() const { return shape_; };
@@ -219,8 +237,16 @@ namespace mcn
         T *data_ptr() { return static_cast<T *>(byte_ptr(0)); }
         template <typename T>
         const T *data_ptr() const { return static_cast<const T *>(byte_ptr(0)); }
-        //
-        void to(Device device);
+        // 原地操作（约定：结尾 _ 表示就地修改，不产生新张量）
+        Tensor &fill_(double value);
+        Tensor &zero_();
+        Tensor &copy_(const Tensor &src);
+        Tensor &add_(const Tensor &other);
+        Tensor &to_(Device device);
+
+        // 非原地：返回副本，原张量不变
+        MCN_UNUSED_RETURN(to)
+        Tensor to(Device device) const;
         Tensor clone() const;
 
     private:
@@ -236,6 +262,12 @@ namespace mcn
         size_t view_offset(size_t linear) const;
         bool is_contiguous() const;
         Tensor make_view() const;
+        void check_inplace(const char *who) const;
+
+        // 算子
+        MCN_UNUSED_RETURN(binary_op)
+        Tensor binary_op(const Tensor &other, detail::BinaryOp op) const;
+        static constexpr const char *op_name(detail::BinaryOp op);
 
     private:
         bool require_grad_ = false;

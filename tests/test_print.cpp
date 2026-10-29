@@ -13,11 +13,11 @@ int main()
     std::cout << t4 << std::endl;
     std::cout << t_empty1 << "\tshape=" << mcn::format_shape(t_empty1.shape()) << std::endl;
 
-    t1.to(mcn::Device::CUDA);
-    t2.to(mcn::Device::CUDA);
-    t3.to(mcn::Device::CUDA);
-    t4.to(mcn::Device::CUDA);
-    t_empty1.to(mcn::Device::CUDA);
+    t1.to_(mcn::Device::CUDA);
+    t2.to_(mcn::Device::CUDA);
+    t3.to_(mcn::Device::CUDA);
+    t4.to_(mcn::Device::CUDA);
+    t_empty1.to_(mcn::Device::CUDA);
 
     std::cout << t1 << std::endl;
     std::cout << t2 << std::endl;
