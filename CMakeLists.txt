@@ -20,6 +20,7 @@ set(CMAKE_CUDA_ARCHITECTURES native)
 add_library(mcn_core
     src/core/tensor.cpp
     src/core/tensor.cu
+    src/autograd/backward_nodes.cpp
 )
 
 target_include_directories(

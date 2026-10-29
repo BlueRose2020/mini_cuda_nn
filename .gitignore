@@ -8,3 +8,8 @@
 # 想提交某个 example 时用 git add -f examples/xxx.cpp
 examples/*
 !examples/CMakeLists.txt
+
+# 构建/测试时随手重定向出来的日志，不进版本库
+/b.txt
+/r.txt
+/e.txt

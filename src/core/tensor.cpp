@@ -1,12 +1,16 @@
 #include "mini_cuda_nn/core/tensor.h"
+#include "mini_cuda_nn/autograd/backward_nodes.h"
+#include "mini_cuda_nn/autograd/grad_mode.h"
 #include "mini_cuda_nn/core/cuda_check.h"
 #include "mini_cuda_nn/core/dtype_dispatch.h"
 #include "mini_cuda_nn/core/kernel_launch.h"
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <random>
 #include <type_traits>
+#include <unordered_map>
 
 namespace
 {
@@ -116,6 +120,178 @@ namespace
         }
     }
 
+    template <typename T>
+    void host_neg(void *dst, const void *src, size_t n)
+    {
+        const T *s = static_cast<const T *>(src);
+        T *d = static_cast<T *>(dst);
+        if constexpr (std::is_same_v<T, bool>)
+        {
+            for (size_t i = 0; i < n; ++i)
+                d[i] = s[i];
+        }
+        else
+        {
+            for (size_t i = 0; i < n; ++i)
+                d[i] = static_cast<T>(-s[i]);
+        }
+    }
+
+    template <typename T>
+    void host_scale(void *dst, const void *src, double factor, size_t n)
+    {
+        const T *s = static_cast<const T *>(src);
+        T *d = static_cast<T *>(dst);
+        if constexpr (std::is_same_v<T, bool>)
+        {
+            const bool r = (factor != 0.0);
+            for (size_t i = 0; i < n; ++i)
+                d[i] = s[i] && r;
+        }
+        else
+        {
+            const T f = static_cast<T>(factor);
+            for (size_t i = 0; i < n; ++i)
+                d[i] = static_cast<T>(s[i] * f);
+        }
+    }
+
+    std::vector<size_t> broadcast_shape(const std::vector<size_t> &a, const std::vector<size_t> &b)
+    {
+        const size_t n = std::max(a.size(), b.size());
+        std::vector<size_t> out(n, 1);
+        for (size_t i = 0; i < n; ++i)
+        {
+            const size_t da = (i + a.size() < n) ? 1 : a[i + a.size() - n];
+            const size_t db = (i + b.size() < n) ? 1 : b[i + b.size() - n];
+            MCN_CHECK(da == db || da == 1 || db == 1,
+                      "broadcast: incompatible dims {} and {} in {} vs {}",
+                      da, db, mcn::format_shape(a), mcn::format_shape(b));
+            out[i] = std::max(da, db);
+        }
+        return out;
+    }
+
+    template <typename T>
+    void host_binary_strided(mcn::detail::BinaryOp op, void *dst, const void *a, const void *b,
+                             const mcn::detail::BcastArgs &args, size_t n)
+    {
+        T *d = static_cast<T *>(dst);
+        const T *x = static_cast<const T *>(a);
+        const T *y = static_cast<const T *>(b);
+
+        for (size_t i = 0; i < n; ++i)
+        {
+            size_t rem = i, ao = 0, bo = 0;
+            for (int k = args.ndim - 1; k >= 0; --k)
+            {
+                const size_t idx = rem % args.out_shape[k];
+                rem /= args.out_shape[k];
+                ao += idx * args.a_stride[k];
+                bo += idx * args.b_stride[k];
+            }
+            switch (op)
+            {
+            case mcn::detail::BinaryOp::Add: d[i] = x[ao] + y[bo]; break;
+            case mcn::detail::BinaryOp::Sub: d[i] = x[ao] - y[bo]; break;
+            case mcn::detail::BinaryOp::Mul: d[i] = x[ao] * y[bo]; break;
+            }
+        }
+    }
+
+    // 主机端梯度归约
+    template <typename T>
+    void host_sum_to(void *dst, const void *src, const mcn::detail::SumToArgs &args)
+    {
+        constexpr int kMax = mcn::detail::kMaxNdim;
+        T *d = static_cast<T *>(dst);
+        const T *s = static_cast<const T *>(src);
+
+        for (size_t o = 0; o < args.n_out; ++o)
+        {
+            size_t rem = o, base = 0;
+            for (int k = args.ndim - 1; k >= 0; --k)
+            {
+                const size_t idx = rem % args.out_shape[k];
+                rem /= args.out_shape[k];
+                base += (args.src_shape[k] == 1 ? 0 : idx) * args.src_stride[k];
+            }
+
+            size_t bn[kMax] = {};
+            size_t bs[kMax] = {};
+            int nb = 0;
+            for (int k = 0; k < args.ndim; ++k)
+            {
+                if (args.out_shape[k] == 1 && args.src_shape[k] > 1)
+                {
+                    bn[nb] = args.src_shape[k];
+                    bs[nb] = args.src_stride[k];
+                    ++nb;
+                }
+            }
+
+            T acc = T(0);
+            if constexpr (std::is_same_v<T, bool>)
+            {
+                // 归约到 bool：任一为真即为真
+                bool any = false;
+                if (nb == 0)
+                {
+                    any = s[base];
+                }
+                else
+                {
+                    size_t counter[kMax] = {};
+                    while (true)
+                    {
+                        size_t off = base;
+                        for (int k = 0; k < nb; ++k)
+                            off += counter[k] * bs[k];
+                        any = any || s[off];
+
+                        int k = nb - 1;
+                        while (k >= 0 && ++counter[k] >= bn[k])
+                        {
+                            counter[k] = 0;
+                            --k;
+                        }
+                        if (k < 0)
+                            break;
+                    }
+                }
+                d[o] = any;
+            }
+            else
+            {
+                if (nb == 0)
+                {
+                    acc = s[base];
+                }
+                else
+                {
+                    size_t counter[kMax] = {};
+                    while (true)
+                    {
+                        size_t off = base;
+                        for (int k = 0; k < nb; ++k)
+                            off += counter[k] * bs[k];
+                        acc += s[off];
+
+                        int k = nb - 1;
+                        while (k >= 0 && ++counter[k] >= bn[k])
+                        {
+                            counter[k] = 0;
+                            --k;
+                        }
+                        if (k < 0)
+                            break;
+                    }
+                }
+                d[o] = acc;
+            }
+        }
+    }
+
     // 行优先矩阵乘法 out[M,N] = a[M,K] @ b[K,N]
     // 用 i-k-j 循环顺序：内层遍历 j 时 b 的行和 out 的行都是连续访问，
     // 比 i-j-k（内层每次跳 K 个元素）对缓存友好得多。
@@ -219,7 +395,6 @@ namespace mcn
     {
         MCN_CHECK(is_floating_point(dtype), "randn: requires a floating point dtype, got {}", dtype_to_string(dtype));
 
-        // 先在本机生成，再按需搬到设备
         Tensor t = empty(shape, Device::CPU, dtype, require_grad);
         if (t.size_ != 0)
         {
@@ -288,7 +463,6 @@ namespace mcn
         size_t expected_stride = 1;
         for (size_t d = shape_.size(); d-- > 0;)
         {
-            // 长度为 1 的维度不贡献跨步，任何 stride 都等价
             if (shape_[d] == 1)
                 continue;
             if (strides_[d] != expected_stride)
@@ -610,7 +784,6 @@ namespace mcn
     {
         std::vector<size_t> shp = resolve_shape(new_shape, size_, "reshape");
 
-        // 不连续时先物化成连续副本，再在此基础上改形状
         Tensor v = is_contiguous() ? make_view() : clone().make_view();
         v.shape_ = std::move(shp);
         v.calculate_strides();
@@ -644,27 +817,330 @@ namespace mcn
         return is_contiguous() ? make_view() : clone();
     }
 
+    Tensor Tensor::broadcast_to(const std::vector<size_t> &target) const
+    {
+        MCN_CHECK(target.size() >= ndim(),
+                  "broadcast_to: cannot reduce ndim from {} to {}",
+                  format_shape(shape_), format_shape(target));
+
+        const size_t extra = target.size() - ndim();
+        std::vector<size_t> new_strides(target.size(), 0);
+
+        for (size_t i = 0; i < ndim(); ++i)
+        {
+            const size_t t = target[extra + i];
+            const size_t s = shape_[i];
+            MCN_CHECK(s == t || s == 1,
+                      "broadcast_to: dim {} of {} cannot broadcast to {}",
+                      s, format_shape(shape_), format_shape(target));
+            // 广播维 stride 置 0：任何索引都映射到同一元素
+            new_strides[extra + i] = (s == 1 && t != 1) ? 0 : strides_[i];
+        }
+
+        Tensor v = make_view();
+        v.shape_ = target;
+        v.strides_ = std::move(new_strides);
+        v.calculate_size();
+        return v;
+    }
+
+    Tensor Tensor::sum_to(const std::vector<size_t> &target) const
+    {
+        if (shape_ == target)
+            return alias();
+
+        MCN_CHECK(target.size() <= ndim(),
+                  "sum_to: target {} has more dims than source {}",
+                  format_shape(target), format_shape(shape_));
+        MCN_CHECK(ndim() <= static_cast<size_t>(detail::kMaxNdim),
+                  "sum_to: ndim {} exceeds kMaxNdim {}", ndim(), detail::kMaxNdim);
+
+        // 用连续副本做索引，避免处理任意 stride
+        const Tensor src = contiguous();
+
+        detail::SumToArgs args;
+        args.ndim = static_cast<int>(src.ndim());
+        args.n_out = 1;
+
+        // 右对齐：左边补 1
+        const size_t extra = src.ndim() - target.size();
+        for (size_t i = 0; i < src.ndim(); ++i)
+        {
+            const size_t t = (i < extra) ? 1 : target[i - extra];
+            const size_t s = src.shape_[i];
+            MCN_CHECK(t == s || t == 1,
+                      "sum_to: source dim {} cannot reduce to {} (from {} to {})",
+                      s, t, format_shape(src.shape_), format_shape(target));
+            args.out_shape[i] = t;
+            args.src_shape[i] = s;
+            args.src_stride[i] = src.strides_[i];
+            args.n_out *= t;
+        }
+
+        Tensor out = zeros(target, device_, dtype_);
+        if (out.size_ == 0 || src.size_ == 0)
+            return out;
+
+        if (device_ == Device::CPU)
+            detail::dispatch_dtype(dtype_, [&]<typename T>()
+                                   { host_sum_to<T>(out.byte_ptr(0), src.byte_ptr(0), args); });
+        else
+            detail::launch_sum_to(out.byte_ptr(0), src.byte_ptr(0), args, dtype_);
+        return out;
+    }
+
     Tensor Tensor::binary_op(const Tensor &other, detail::BinaryOp op) const
     {
-        MCN_CHECK(shape_ == other.shape_,
-                  "{}: shape mismatch {} vs {}", op_name(op),
-                  format_shape(shape_), format_shape(other.shape_));
         MCN_CHECK(device_ == other.device_, "{}: device mismatch", op_name(op));
         MCN_CHECK(dtype_ == other.dtype_, "{}: dtype mismatch {} vs {}", op_name(op),
                   dtype_to_string(dtype_), dtype_to_string(other.dtype_));
-        MCN_CHECK(is_contiguous() && other.is_contiguous(),
-                  "{}: requires contiguous tensors", op_name(op));
 
-        Tensor out = empty(shape_, device_, dtype_, require_grad_ || other.require_grad_);
+        const std::vector<size_t> out_shape = broadcast_shape(shape_, other.shape_);
+
+        const bool track = detail::grad_enabled() && (require_grad_ || other.require_grad_);
+        Tensor out = empty(out_shape, device_, dtype_, track);
+        if (out.size_ == 0)
+            return out;
+
+        const bool fast = (shape_ == out_shape && other.shape_ == out_shape &&
+                           is_contiguous() && other.is_contiguous());
+
+        if (fast)
+        {
+            if (device_ == Device::CPU)
+                detail::dispatch_dtype(dtype_, [&]<typename T>()
+                                       { host_binary<T>(op, out.byte_ptr(0), byte_ptr(0), other.byte_ptr(0), size_); });
+            else
+                detail::launch_binary(op, out.byte_ptr(0), byte_ptr(0), other.byte_ptr(0), size_, dtype_);
+        }
+        else
+        {
+            // 广播/非连续统一走 strided 路径
+            MCN_CHECK(out_shape.size() <= static_cast<size_t>(detail::kMaxNdim),
+                      "{}: ndim {} exceeds kMaxNdim {}", op_name(op), out_shape.size(), detail::kMaxNdim);
+
+            const Tensor lhs = broadcast_to(out_shape);
+            const Tensor rhs = other.broadcast_to(out_shape);
+
+            detail::BcastArgs args;
+            args.ndim = static_cast<int>(out_shape.size());
+            for (size_t i = 0; i < out_shape.size(); ++i)
+            {
+                args.out_shape[i] = out_shape[i];
+                args.a_stride[i] = lhs.strides_[i];
+                args.b_stride[i] = rhs.strides_[i];
+            }
+
+            if (device_ == Device::CPU)
+                detail::dispatch_dtype(dtype_, [&]<typename T>()
+                                       { host_binary_strided<T>(op, out.byte_ptr(0), lhs.byte_ptr(0), rhs.byte_ptr(0), args, out.size_); });
+            else
+                detail::launch_binary_strided(op, out.byte_ptr(0), lhs.byte_ptr(0), rhs.byte_ptr(0), args, out.size_, dtype_);
+        }
+
+        if (track)
+            detail::attach_binary(*this, other, op, out);
+        return out;
+    }
+
+    Tensor Tensor::neg() const
+    {
+        const bool track = detail::grad_enabled() && require_grad_;
+        Tensor out = empty(shape_, device_, dtype_, track);
         if (size_ == 0)
             return out;
 
         if (device_ == Device::CPU)
             detail::dispatch_dtype(dtype_, [&]<typename T>()
-                                   { host_binary<T>(op, out.byte_ptr(0), byte_ptr(0), other.byte_ptr(0), size_); });
+                                   { host_neg<T>(out.byte_ptr(0), byte_ptr(0), size_); });
         else
-            detail::launch_binary(op, out.byte_ptr(0), byte_ptr(0), other.byte_ptr(0), size_, dtype_);
+            detail::launch_unary(detail::UnaryOp::Neg, out.byte_ptr(0), byte_ptr(0), size_, dtype_);
+
+        if (track)
+            detail::attach_neg(*this, out);
         return out;
+    }
+
+    Tensor Tensor::operator-() const
+    {
+        return neg();
+    }
+
+    Tensor Tensor::mul_scalar(double factor) const
+    {
+        const bool track = detail::grad_enabled() && require_grad_;
+        Tensor out = empty(shape_, device_, dtype_, track);
+        if (size_ == 0)
+            return out;
+
+        if (device_ == Device::CPU)
+            detail::dispatch_dtype(dtype_, [&]<typename T>()
+                                   { host_scale<T>(out.byte_ptr(0), byte_ptr(0), factor, size_); });
+        else
+            detail::launch_scale(out.byte_ptr(0), byte_ptr(0), factor, size_, dtype_);
+
+        if (track)
+            detail::attach_scalar_mul(*this, factor, out);
+        return out;
+    }
+
+    Tensor &Tensor::zero_grad()
+    {
+        grad_.reset();
+        return *this;
+    }
+
+    Tensor Tensor::sum() const
+    {
+        const bool track = detail::grad_enabled() && require_grad_;
+        Tensor out = sum_to({});
+        out.set_require_grad(track);
+        if (track)
+            detail::attach_sum(*this, std::vector<int>(ndim(), 1), out);
+        return out;
+    }
+
+    Tensor Tensor::sum(int dim, bool keepdim) const
+    {
+        const int nd = static_cast<int>(ndim());
+        MCN_CHECK(nd > 0, "sum(dim): cannot reduce a 0-dim tensor");
+        const int d = dim < 0 ? dim + nd : dim;
+        MCN_CHECK(d >= 0 && d < nd, "sum(dim): dim {} out of range for {}",
+                  dim, format_shape(shape_));
+
+        std::vector<int> kd(nd);
+        std::vector<size_t> tgt(static_cast<size_t>(nd));
+        for (int i = 0; i < nd; ++i)
+        {
+            kd[i] = (i == d) ? 1 : static_cast<int>(shape_[i]);
+            tgt[static_cast<size_t>(i)] = static_cast<size_t>(kd[i]);
+        }
+
+        const bool track = detail::grad_enabled() && require_grad_;
+        Tensor out = sum_to(tgt);
+        out.set_require_grad(track);
+
+        if (!keepdim)
+        {
+            std::vector<int> shp;
+            shp.reserve(nd - 1);
+            for (int i = 0; i < nd; ++i)
+                if (i != d)
+                    shp.push_back(kd[i]);
+            
+            out = out.reshape(shp);
+        }
+
+        if (track)
+            detail::attach_sum(*this, kd, out);
+        return out;
+    }
+
+    Tensor Tensor::mean() const
+    {
+        MCN_CHECK(size_ != 0, "mean(): cannot average an empty tensor");
+        return sum().mul_scalar(1.0 / static_cast<double>(size_));
+    }
+
+    Tensor Tensor::mean(int dim, bool keepdim) const
+    {
+        const int nd = static_cast<int>(ndim());
+        MCN_CHECK(nd > 0, "mean(dim): cannot reduce a 0-dim tensor");
+        const int d = dim < 0 ? dim + nd : dim;
+        MCN_CHECK(d >= 0 && d < nd, "mean(dim): dim {} out of range for {}",
+                  dim, format_shape(shape_));
+        MCN_CHECK(shape_[d] != 0, "mean(dim): cannot average a zero-length dimension");
+
+        return sum(d, keepdim).mul_scalar(1.0 / static_cast<double>(shape_[d]));
+    }
+
+    void Tensor::accumulate_grad(const Tensor &g) const
+    {
+        if (g.data_ptr() == nullptr)
+            return;
+
+        MCN_CHECK(shape_ == g.shape_, "accumulate_grad: shape mismatch {} vs {}",
+                  format_shape(shape_), format_shape(g.shape_));
+        MCN_CHECK(device_ == g.device_, "accumulate_grad: device mismatch");
+        MCN_CHECK(dtype_ == g.dtype_, "accumulate_grad: dtype mismatch {} vs {}",
+                  dtype_to_string(dtype_), dtype_to_string(g.dtype_));
+
+        const Tensor src = g.contiguous();
+        if (!grad_)
+            grad_ = std::make_shared<Tensor>(src.clone());
+        else
+            grad_->add_(src);
+    }
+
+    void Tensor::backward()
+    {
+        MCN_CHECK(grad_fn_ != nullptr,
+                  "backward(): this tensor is not part of a graph "
+                  "(missing require_grad on inputs, or produced by an op without a backward)");
+        MCN_CHECK(is_floating_point(dtype_), "backward(): requires a floating point tensor, got {}",
+                  dtype_to_string(dtype_));
+
+        // 1. 拓扑排序：DFS 后序，再反转 => 输出节点在前，叶子在后
+        std::vector<GradFn *> order;
+        std::unordered_map<GradFn *, bool> visited;
+        std::function<void(GradFn *)> visit = [&](GradFn *n)
+        {
+            if (visited[n])
+                return;
+            visited[n] = true;
+            for (const auto &e : n->edges)
+                if (e.fn)
+                    visit(e.fn.get());
+            order.push_back(n);
+        };
+        visit(grad_fn_.get());
+        std::reverse(order.begin(), order.end());
+
+        // 2. 播种：对输出整体求导，等价于 grad_output = 全 1
+        std::unordered_map<GradFn *, Tensor> pending;
+        pending.emplace(grad_fn_.get(), ones(shape_, device_, dtype_));
+
+        // 3. 按拓扑序反传（反向公式里的算子不应再建图）
+        detail::NoGradGuard guard;
+        for (GradFn *node : order)
+        {
+            auto it = pending.find(node);
+            if (it == pending.end())
+                continue;
+
+            const Tensor gout = it->second;
+            std::vector<Tensor> grads = node->backward(gout);
+            MCN_CHECK(grads.size() == node->edges.size(),
+                      "{}: returned {} grads for {} edges",
+                      node->name(), grads.size(), node->edges.size());
+
+            for (size_t i = 0; i < grads.size(); ++i)
+            {
+                const Edge &e = node->edges[i];
+                if (!e.sink && !e.fn)
+                    continue;
+                if (grads[i].data_ptr() == nullptr)
+                    continue;
+
+                // 前向可能做过广播：把梯度归约回该输入原本的形状
+                Tensor gi = grads[i];
+                if (gi.shape() != e.shape)
+                    gi = gi.sum_to(e.shape);
+
+                if (e.fn)
+                {
+                    auto jt = pending.find(e.fn.get());
+                    if (jt == pending.end())
+                        pending.emplace(e.fn.get(), gi.contiguous().clone());
+                    else
+                        jt->second.add_(gi.contiguous());
+                }
+                else
+                {
+                    e.sink->accumulate_grad(gi);
+                }
+            }
+        }
     }
 
     constexpr const char *Tensor::op_name(detail::BinaryOp op)
@@ -748,7 +1224,6 @@ namespace mcn
 
         if (device_ == Device::CPU)
         {
-            // matmul 只支持浮点（上面已校验），bool 分支不实例化，避免 bool 算术告警
             detail::dispatch_dtype(dtype_, [&]<typename T>()
                                    {
                                        if constexpr (!std::is_same_v<T, bool>)
@@ -757,10 +1232,18 @@ namespace mcn
         else
         {
             detail::launch_matmul(dst, lhs, rhs, M, K, N, dtype_);
-            // kernel 是异步的；若上面 clone 出了临时 device buffer，
-            // 它会在函数返回时释放，必须先等 kernel 读完
             if (lhs_cloned || rhs_cloned)
                 CUDA_CHECK(cudaDeviceSynchronize());
+        }
+
+        // 目前只有 2-D @ 2-D 挂反向节点（1-D 需要形状还原，暂不支持）
+        const bool track = detail::grad_enabled() && (require_grad_ || other.require_grad_);
+        if (track)
+        {
+            MCN_CHECK(!lhs_1d && !rhs_1d,
+                      "matmul: backward is only implemented for 2-D @ 2-D, "
+                      "got {} @ {}", format_shape(shape_), format_shape(other.shape_));
+            detail::attach_matmul(*this, other, out);
         }
         return out;
     }

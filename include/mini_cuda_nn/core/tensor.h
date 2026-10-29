@@ -10,9 +10,13 @@
 
 #include "device.h"
 #include "dtype.h"
-#include "mini_cuda_nn/autograd/grad_fn.h"
 #include "mini_cuda_nn/core/cuda_check.h"
 #include "mini_cuda_nn/core/kernel_launch.h"
+
+namespace mcn
+{
+    class GradFn;
+}
 
 #define MCN_UNUSED_EXPRESSION [[nodiscard("expression result is unused - did you forget to use the returned Tensor?")]]
 #define MCN_UNUSED_RETURN(func) [[nodiscard("result of " #func " is unused")]]
@@ -176,11 +180,25 @@ namespace mcn
         Tensor operator-(const Tensor &other) const;
         MCN_UNUSED_EXPRESSION
         Tensor operator*(const Tensor &other) const;
+
+        // 标量乘：只改变数值，不改变 dtype（对标量做 static_cast）。
+        // 非模板入口放在 .cpp，模板只在 header 里把它转发一下。
+        MCN_UNUSED_RETURN(mul_scalar)
+        Tensor mul_scalar(double factor) const;
         template <typename T>
             requires std::is_arithmetic_v<T>
         MCN_UNUSED_EXPRESSION
             Tensor
-            operator*(const T &scalar) const;
+            operator*(const T &scalar) const
+        {
+            return mul_scalar(static_cast<double>(scalar));
+        }
+
+        // 一元取负：-x
+        MCN_UNUSED_RETURN(neg)
+        Tensor neg() const;
+        MCN_UNUSED_EXPRESSION
+        Tensor operator-() const;
 
         // 矩阵乘法：2D @ 2D、1D @ 2D、2D @ 1D、1D @ 1D
         MCN_UNUSED_RETURN(matmul)
@@ -204,9 +222,16 @@ namespace mcn
 
         // 梯度相关方法
         bool require_grad() const { return require_grad_; };
+        void set_require_grad(bool v) { require_grad_ = v; };
         const Tensor *grad() const { return grad_.get(); };
         std::shared_ptr<GradFn> grad_fn() const { return grad_fn_; };
         void set_grad_fn(std::shared_ptr<GradFn> grad_fn) { grad_fn_ = grad_fn; };
+
+        Tensor alias() const { return make_view(); }
+        void accumulate_grad(const Tensor &g) const;
+
+        // 清空梯度（每轮迭代前调用，否则梯度会一直累加）
+        Tensor &zero_grad();
 
         void backward();
 
@@ -221,6 +246,22 @@ namespace mcn
         Tensor t() const;
         MCN_UNUSED_RETURN(contiguous)
         Tensor contiguous() const;
+
+        MCN_UNUSED_RETURN(broadcast_to)
+        Tensor broadcast_to(const std::vector<size_t> &target) const;
+
+        MCN_UNUSED_RETURN(sum_to)
+        Tensor sum_to(const std::vector<size_t> &target) const;
+
+        // 归约（正向由 sum_to 实现，因此 CPU / CUDA 共用同一套逻辑）
+        MCN_UNUSED_RETURN(sum)
+        Tensor sum() const;                                   // 全归约，返回 0 维
+        MCN_UNUSED_RETURN(sum)
+        Tensor sum(int dim, bool keepdim = false) const;      // 沿一维归约
+        MCN_UNUSED_RETURN(mean)
+        Tensor mean() const;
+        MCN_UNUSED_RETURN(mean)
+        Tensor mean(int dim, bool keepdim = false) const;
 
         // 属性访问
         std::vector<size_t> shape() const { return shape_; };
@@ -271,7 +312,7 @@ namespace mcn
 
     private:
         bool require_grad_ = false;
-        std::shared_ptr<Tensor> grad_ = nullptr;
+        mutable std::shared_ptr<Tensor> grad_ = nullptr;
         std::shared_ptr<GradFn> grad_fn_ = nullptr;
 
         std::shared_ptr<void> data_;
@@ -283,3 +324,6 @@ namespace mcn
         DataType dtype_ = DataType::FLOAT32;
     };
 } // namespace mcn
+
+// 必须在 Tensor 定义之后：grad_fn.h 里的 Edge / GradFn 用到了完整的 Tensor
+#include "mini_cuda_nn/autograd/grad_fn.h"
