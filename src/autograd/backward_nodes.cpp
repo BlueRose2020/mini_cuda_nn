@@ -1,4 +1,4 @@
-#include "mini_cuda_nn/autograd/backward_nodes.h"
+#include "mini_cuda_nn/detail/backward_nodes.h"
 #include "mini_cuda_nn/autograd/grad_mode.h"
 
 #include <memory>
@@ -16,7 +16,9 @@ namespace
         Edge e;
         e.fn = t.grad_fn();
         if (!e.fn && t.require_grad())
-            e.sink = &t;        e.shape = t.shape();        if (save)
+            e.sink = &t; // 叶子：反向时把梯度累加回这个对象
+        e.shape = t.shape();
+        if (save)
             e.saved = std::make_shared<Tensor>(t.alias());
         return e;
     }
@@ -118,6 +120,54 @@ namespace
 
     private:
         double factor_;
+    };
+
+    // y = relu(x)  =>  dx = g * (x > 0)
+    class ReluBackward : public GradFn
+    {
+    public:
+        const char *name() const override { return "relu_backward"; }
+
+        std::vector<Tensor> backward(const Tensor &g) override
+        {
+            MCN_CHECK(edges.size() == 1 && edges[0].saved,
+                      "relu_backward: missing saved input");
+
+            std::vector<Tensor> out;
+            out.reserve(1);
+            if (!needs_grad(edges[0]))
+            {
+                out.push_back(Tensor());
+                return out;
+            }
+            // relu_grad 按线性下标访问，两个输入都先确保连续（已连续时不拷贝）
+            out.push_back(edges[0].saved->contiguous().relu_grad(g.contiguous()));
+            return out;
+        }
+    };
+
+    // ---------------- 视图 ----------------
+    // y = x.transpose(d0, d1)  =>  dx = g.transpose(d0, d1)
+    class TransposeBackward : public GradFn
+    {
+    public:
+        TransposeBackward(int d0, int d1) : d0_(d0), d1_(d1) {}
+
+        const char *name() const override { return "transpose_backward"; }
+
+        std::vector<Tensor> backward(const Tensor &g) override
+        {
+            MCN_CHECK(edges.size() == 1, "transpose_backward: expected 1 edge, got {}", edges.size());
+
+            std::vector<Tensor> out;
+            out.reserve(1);
+            out.push_back(needs_grad(edges[0]) ? g.transpose(d0_, d1_) : Tensor());
+            return out;
+        }
+
+    private:
+        int d0_;
+        int d1_;
     };
 
     // ---------------- 归约 ----------------
@@ -224,6 +274,20 @@ namespace mcn::detail
     {
         auto node = std::make_shared<NegBackward>();
         node->edges.push_back(make_edge(in, false));
+        out.set_grad_fn(std::move(node));
+    }
+
+    void attach_relu(const Tensor &in, Tensor &out)
+    {
+        auto node = std::make_shared<ReluBackward>();
+        node->edges.push_back(make_edge(in, /*save=*/true));
+        out.set_grad_fn(std::move(node));
+    }
+
+    void attach_transpose(const Tensor &in, int d0, int d1, Tensor &out)
+    {
+        auto node = std::make_shared<TransposeBackward>(d0, d1);
+        node->edges.push_back(make_edge(in, /*save=*/false)); // 反向只需要交换回两个维
         out.set_grad_fn(std::move(node));
     }
     void attach_sum(const Tensor &in, std::vector<int> keepdim_shape, Tensor &out)

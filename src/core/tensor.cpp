@@ -1,8 +1,8 @@
 #include "mini_cuda_nn/core/tensor.h"
-#include "mini_cuda_nn/autograd/backward_nodes.h"
+#include "mini_cuda_nn/detail/backward_nodes.h"
 #include "mini_cuda_nn/autograd/grad_mode.h"
 #include "mini_cuda_nn/core/cuda_check.h"
-#include "mini_cuda_nn/core/dtype_dispatch.h"
+#include "mini_cuda_nn/detail/dtype_dispatch.h"
 #include "mini_cuda_nn/core/kernel_launch.h"
 
 #include <algorithm>
@@ -154,6 +154,25 @@ namespace
             for (size_t i = 0; i < n; ++i)
                 d[i] = static_cast<T>(s[i] * f);
         }
+    }
+
+    template <typename T>
+    void host_relu(void *dst, const void *src, size_t n)
+    {
+        const T *s = static_cast<const T *>(src);
+        T *d = static_cast<T *>(dst);
+        for (size_t i = 0; i < n; ++i)
+            d[i] = s[i] > T(0) ? s[i] : T(0);
+    }
+
+    template <typename T>
+    void host_relu_backward(void *dst, const void *grad, const void *input, size_t n)
+    {
+        T *d = static_cast<T *>(dst);
+        const T *g = static_cast<const T *>(grad);
+        const T *x = static_cast<const T *>(input);
+        for (size_t i = 0; i < n; ++i)
+            d[i] = x[i] > T(0) ? g[i] : T(0);
     }
 
     std::vector<size_t> broadcast_shape(const std::vector<size_t> &a, const std::vector<size_t> &b)
@@ -330,37 +349,6 @@ namespace mcn
         calculate_size();
         allocate_memory();
         copy_memory(data, Device::CPU);
-    }
-
-    Tensor::Tensor(const Tensor &other)
-        : require_grad_(other.require_grad_),
-          grad_(nullptr),
-          grad_fn_(nullptr),
-          offset_(0),
-          size_(other.size_),
-          shape_(other.shape_),
-          device_(other.device_),
-          dtype_(other.dtype_)
-    {
-        allocate_memory();
-
-        if (other.size_ == 0)
-            return;
-
-        if (other.is_contiguous())
-        {
-            copy_memory(other.byte_ptr(0), other.device_);
-        }
-        else
-        {
-            MCN_CHECK(other.device_ == Device::CPU,
-                      "copying a non-contiguous CUDA view is not supported yet");
-            const size_t esz = itemsize(dtype_);
-            const char *src = static_cast<const char *>(other.byte_ptr(0)); // 已包含 other.offset_
-            char *dst = static_cast<char *>(data_.get());
-            for (size_t i = 0; i < size_; ++i)
-                std::memcpy(dst + i * esz, src + other.view_offset(i) * esz, esz);
-        }
     }
 
     Tensor::~Tensor() = default;
@@ -646,9 +634,70 @@ namespace mcn
         return v;
     }
 
+    // 深拷贝：分配新存储、物化数据。非连续视图会被压平成连续副本（offset_ 归 0）。
+    // 注意：clone 不接计算图（grad_fn_ 为空），需要可微的复制得另加 CloneBackward。
     Tensor Tensor::clone() const
     {
-        return Tensor(*this);
+        Tensor out;
+        out.require_grad_ = require_grad_;
+        out.size_ = size_;
+        out.shape_ = shape_;
+        out.device_ = device_;
+        out.dtype_ = dtype_;
+        out.allocate_memory(); // 新 buffer + 重算 strides_ + offset_ 归 0
+
+        if (size_ == 0)
+            return out;
+
+        if (is_contiguous())
+        {
+            out.copy_memory(byte_ptr(0), device_);
+        }
+        else if (device_ == Device::CPU)
+        {
+            const size_t esz = itemsize(dtype_);
+            const char *src = static_cast<const char *>(byte_ptr(0)); // 已包含 offset_
+            char *dst = static_cast<char *>(out.data_.get());
+            for (size_t i = 0; i < size_; ++i)
+                std::memcpy(dst + i * esz, src + view_offset(i) * esz, esz);
+        }
+        else
+        {
+            // CUDA 上的非连续视图：用带 stride 的 kernel 物化（主机端解引用设备指针是非法访问）
+            MCN_CHECK(shape_.size() <= static_cast<size_t>(detail::kMaxNdim),
+                      "clone(): ndim {} exceeds kMaxNdim {}", shape_.size(), detail::kMaxNdim);
+
+            detail::StridedArgs args;
+            args.ndim = static_cast<int>(shape_.size());
+            for (size_t i = 0; i < shape_.size(); ++i)
+            {
+                args.shape[i] = shape_[i];
+                args.stride[i] = strides_[i];
+            }
+            detail::launch_copy_strided(out.byte_ptr(0), byte_ptr(0), args, size_, dtype_);
+        }
+        return out;
+    }
+
+    Tensor Tensor::detach() const
+    {
+        // 共享存储、但不参与计算图；grad_fn_ 已被 make_view 清空
+        Tensor v = make_view();
+        v.require_grad_ = false;
+        return v;
+    }
+
+    double Tensor::item() const
+    {
+        MCN_CHECK(size_ == 1, "item(): expected exactly 1 element, got {} for {}",
+                  size_, format_shape(shape_));
+        if (device_ != Device::CPU)
+            return to(Device::CPU).item();
+
+        double v = 0.0;
+        detail::dispatch_dtype(dtype_, [&]<typename T>()
+                               { v = static_cast<double>(*static_cast<const T *>(byte_ptr(0))); });
+        return v;
     }
 
     // --------------原地操作---------------
@@ -803,6 +852,13 @@ namespace mcn
         Tensor v = make_view();
         std::swap(v.shape_[d0], v.shape_[d1]);
         std::swap(v.strides_[d0], v.strides_[d1]);
+
+        // 转置是视图，但反向可以精确表达（梯度转回来），
+        // 所以它是唯一带 grad_fn 的视图算子。否则 x.t() 这类临时视图
+        // 一旦进入计算图，Edge::sink 就会指向已销毁的对象。
+        const bool track = detail::grad_enabled() && require_grad_;
+        if (track)
+            detail::attach_transpose(*this, d0, d1, v);
         return v;
     }
 
@@ -966,6 +1022,52 @@ namespace mcn
         return neg();
     }
 
+    Tensor Tensor::relu() const
+    {
+        MCN_CHECK(is_floating_point(dtype_), "relu: requires a floating point dtype, got {}",
+                  dtype_to_string(dtype_));
+
+        const bool track = detail::grad_enabled() && require_grad_;
+        Tensor out = empty(shape_, device_, dtype_, track);
+        if (size_ == 0)
+            return out;
+
+        if (device_ == Device::CPU)
+            detail::dispatch_dtype(dtype_, [&]<typename T>()
+                                   {
+                                       if constexpr (!std::is_same_v<T, bool>)
+                                           host_relu<T>(out.byte_ptr(0), byte_ptr(0), size_); });
+        else
+            detail::launch_relu(out.byte_ptr(0), byte_ptr(0), size_, dtype_);
+
+        if (track)
+            detail::attach_relu(*this, out);
+        return out;
+    }
+
+    // dx = grad * (input > 0)，按元素独立，不需要 shape 广播
+    Tensor Tensor::relu_grad(const Tensor &grad) const
+    {
+        MCN_CHECK(grad.shape_ == shape_ && grad.device_ == device_ && grad.dtype_ == dtype_,
+                  "relu_grad: grad must match input ({} vs {}, device/dtype equal)",
+                  format_shape(grad.shape_), format_shape(shape_));
+
+        Tensor out = empty(shape_, device_, dtype_, false);
+        if (size_ == 0)
+            return out;
+
+        if (device_ == Device::CPU)
+            detail::dispatch_dtype(dtype_, [&]<typename T>()
+                                   {
+                                       if constexpr (!std::is_same_v<T, bool>)
+                                           host_relu_backward<T>(out.byte_ptr(0), grad.byte_ptr(0),
+                                                                 byte_ptr(0), size_); });
+        else
+            detail::launch_relu_backward(out.byte_ptr(0), grad.byte_ptr(0), byte_ptr(0),
+                                         size_, dtype_);
+        return out;
+    }
+
     Tensor Tensor::mul_scalar(double factor) const
     {
         const bool track = detail::grad_enabled() && require_grad_;
@@ -1070,77 +1172,6 @@ namespace mcn
             grad_ = std::make_shared<Tensor>(src.clone());
         else
             grad_->add_(src);
-    }
-
-    void Tensor::backward()
-    {
-        MCN_CHECK(grad_fn_ != nullptr,
-                  "backward(): this tensor is not part of a graph "
-                  "(missing require_grad on inputs, or produced by an op without a backward)");
-        MCN_CHECK(is_floating_point(dtype_), "backward(): requires a floating point tensor, got {}",
-                  dtype_to_string(dtype_));
-
-        // 1. 拓扑排序：DFS 后序，再反转 => 输出节点在前，叶子在后
-        std::vector<GradFn *> order;
-        std::unordered_map<GradFn *, bool> visited;
-        std::function<void(GradFn *)> visit = [&](GradFn *n)
-        {
-            if (visited[n])
-                return;
-            visited[n] = true;
-            for (const auto &e : n->edges)
-                if (e.fn)
-                    visit(e.fn.get());
-            order.push_back(n);
-        };
-        visit(grad_fn_.get());
-        std::reverse(order.begin(), order.end());
-
-        // 2. 播种：对输出整体求导，等价于 grad_output = 全 1
-        std::unordered_map<GradFn *, Tensor> pending;
-        pending.emplace(grad_fn_.get(), ones(shape_, device_, dtype_));
-
-        // 3. 按拓扑序反传（反向公式里的算子不应再建图）
-        detail::NoGradGuard guard;
-        for (GradFn *node : order)
-        {
-            auto it = pending.find(node);
-            if (it == pending.end())
-                continue;
-
-            const Tensor gout = it->second;
-            std::vector<Tensor> grads = node->backward(gout);
-            MCN_CHECK(grads.size() == node->edges.size(),
-                      "{}: returned {} grads for {} edges",
-                      node->name(), grads.size(), node->edges.size());
-
-            for (size_t i = 0; i < grads.size(); ++i)
-            {
-                const Edge &e = node->edges[i];
-                if (!e.sink && !e.fn)
-                    continue;
-                if (grads[i].data_ptr() == nullptr)
-                    continue;
-
-                // 前向可能做过广播：把梯度归约回该输入原本的形状
-                Tensor gi = grads[i];
-                if (gi.shape() != e.shape)
-                    gi = gi.sum_to(e.shape);
-
-                if (e.fn)
-                {
-                    auto jt = pending.find(e.fn.get());
-                    if (jt == pending.end())
-                        pending.emplace(e.fn.get(), gi.contiguous().clone());
-                    else
-                        jt->second.add_(gi.contiguous());
-                }
-                else
-                {
-                    e.sink->accumulate_grad(gi);
-                }
-            }
-        }
     }
 
     constexpr const char *Tensor::op_name(detail::BinaryOp op)

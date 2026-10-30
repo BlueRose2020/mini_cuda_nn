@@ -1,5 +1,5 @@
 #include "mini_cuda_nn/core/cuda_check.h"
-#include "mini_cuda_nn/core/dtype_dispatch.h"
+#include "mini_cuda_nn/detail/dtype_dispatch.h"
 #include "mini_cuda_nn/core/kernel_launch.h"
 
 #include <algorithm>
@@ -32,6 +32,29 @@ namespace
         const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
         for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride)
             dst[i] = src[i];
+    }
+
+    // 把线性下标翻译成带 stride 的偏移（广播维 stride 为 0，天然支持）
+    __device__ __forceinline__ size_t strided_offset(const mcn::detail::StridedArgs &args, size_t i)
+    {
+        size_t off = 0;
+        size_t rem = i;
+        for (int d = args.ndim - 1; d >= 0; --d)
+        {
+            const size_t dim = args.shape[d];
+            off += (rem % dim) * args.stride[d];
+            rem /= dim;
+        }
+        return off;
+    }
+
+    template <typename T>
+    __global__ void copy_strided_kernel(T *dst, const T *src,
+                                        mcn::detail::StridedArgs args, size_t n)
+    {
+        const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+        for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride)
+            dst[i] = src[strided_offset(args, i)];
     }
 
     template <typename T>
@@ -72,6 +95,23 @@ namespace
         const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
         for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride)
             dst[i] = src[i] * factor;
+    }
+
+    template <typename T>
+    __global__ void relu_kernel(T *dst, const T *src, size_t n)
+    {
+        const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+        for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride)
+            dst[i] = src[i] > T(0) ? src[i] : T(0);
+    }
+
+    // relu 的导数：输入大于 0 才放行梯度
+    template <typename T>
+    __global__ void relu_backward_kernel(T *dst, const T *grad, const T *input, size_t n)
+    {
+        const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+        for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride)
+            dst[i] = input[i] > T(0) ? grad[i] : T(0);
     }
 
     __device__ __forceinline__ void bcast_offsets(
@@ -244,6 +284,13 @@ namespace
     }
 
     template <typename T>
+    void copy_strided_impl(void *dst, const void *src, const mcn::detail::StridedArgs &args, size_t n)
+    {
+        copy_strided_kernel<T><<<grid_for(n), kBlock>>>(static_cast<T *>(dst),
+                                                        static_cast<const T *>(src), args, n);
+    }
+
+    template <typename T>
     void add_impl(void *dst, const void *a, const void *b, size_t n)
     {
         add_kernel<T><<<grid_for(n), kBlock>>>(static_cast<T *>(dst),
@@ -280,6 +327,21 @@ namespace
         scale_kernel<T><<<grid_for(n), kBlock>>>(static_cast<T *>(dst),
                                                  static_cast<const T *>(src),
                                                  static_cast<T>(factor), n);
+    }
+
+    template <typename T>
+    void relu_impl(void *dst, const void *src, size_t n)
+    {
+        relu_kernel<T><<<grid_for(n), kBlock>>>(static_cast<T *>(dst),
+                                                static_cast<const T *>(src), n);
+    }
+
+    template <typename T>
+    void relu_backward_impl(void *dst, const void *grad, const void *input, size_t n)
+    {
+        relu_backward_kernel<T><<<grid_for(n), kBlock>>>(static_cast<T *>(dst),
+                                                         static_cast<const T *>(grad),
+                                                         static_cast<const T *>(input), n);
     }
 
     template <typename T>
@@ -358,6 +420,14 @@ namespace mcn::detail
                        { copy_impl<T>(dst, src, n); });
     }
 
+    void launch_copy_strided(void *dst, const void *src, const StridedArgs &args,
+                             size_t n, DataType dtype)
+    {
+        launch_checked(dtype, n, dst != nullptr && src != nullptr && args.ndim > 0,
+                       [&]<typename T>()
+                       { copy_strided_impl<T>(dst, src, args, n); });
+    }
+
     void launch_binary(BinaryOp op, void *dst, const void *a, const void *b,
                        size_t n, DataType dtype)
     {
@@ -397,6 +467,30 @@ namespace mcn::detail
     {
         launch_checked(dtype, n, dst != nullptr && src != nullptr, [&]<typename T>()
                        { scale_impl<T>(dst, src, factor, n); });
+    }
+
+    void launch_relu(void *dst, const void *src, size_t n, DataType dtype)
+    {
+        // bool 没有“大于 0”，不实例化
+        launch_checked(dtype, n, dst != nullptr && src != nullptr && dtype != DataType::BOOL,
+                       [&]<typename T>()
+                       {
+                           if constexpr (!std::is_same_v<T, bool>)
+                               relu_impl<T>(dst, src, n);
+                       });
+    }
+
+    void launch_relu_backward(void *dst, const void *grad, const void *input,
+                              size_t n, DataType dtype)
+    {
+        launch_checked(dtype, n,
+                       dst != nullptr && grad != nullptr && input != nullptr &&
+                           dtype != DataType::BOOL,
+                       [&]<typename T>()
+                       {
+                           if constexpr (!std::is_same_v<T, bool>)
+                               relu_backward_impl<T>(dst, grad, input, n);
+                       });
     }
 
     void launch_binary_strided(BinaryOp op, void *dst, const void *a, const void *b,

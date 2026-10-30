@@ -9,7 +9,6 @@
 examples/*
 !examples/CMakeLists.txt
 
-# 构建/测试时随手重定向出来的日志，不进版本库
-/b.txt
-/r.txt
-/e.txt
+# 成品示例（带自己的 CMakeLists.txt 的多文件项目）整目录进版本库。
+# examples/* 里的 * 不跨目录，所以放行目录本身即可。
+!examples/dqn_snake/

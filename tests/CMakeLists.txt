@@ -4,4 +4,12 @@ target_link_libraries(test_print PRIVATE mcn_core)
 add_executable(test_tensor test_tensor.cpp)
 target_link_libraries(test_tensor PRIVATE mcn_core)
 
+add_executable(test_optim test_optim.cpp)
+target_link_libraries(test_optim PRIVATE mcn_core)
+
+add_executable(test_nn test_nn.cpp)
+target_link_libraries(test_nn PRIVATE mcn_core)
+
 add_test(NAME test_tensor COMMAND test_tensor)
+add_test(NAME test_optim COMMAND test_optim)
+add_test(NAME test_nn COMMAND test_nn)

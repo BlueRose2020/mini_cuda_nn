@@ -38,9 +38,21 @@ namespace mcn::detail
         size_t n_out = 0;
     };
 
+    // 按任意 stride 把源拷成连续布局（用于 clone 非连续视图）
+    struct StridedArgs
+    {
+        int ndim = 0;
+        size_t shape[kMaxNdim] = {};
+        size_t stride[kMaxNdim] = {};
+    };
+
     void launch_fill(void *dst, double value, size_t n, DataType dtype);
 
     void launch_copy(void *dst, const void *src, size_t n, DataType dtype);
+
+    // dst[i] = src[stride_offset(i)]，把非连续视图物化成连续布局
+    void launch_copy_strided(void *dst, const void *src, const StridedArgs &args,
+                             size_t n, DataType dtype);
 
     void launch_binary(BinaryOp op, void *dst, const void *a, const void *b,
                        size_t n, DataType dtype);
@@ -53,6 +65,13 @@ namespace mcn::detail
     void launch_sum_to(void *dst, const void *src, const SumToArgs &args, DataType dtype);
 
     void launch_unary(UnaryOp op, void *dst, const void *src, size_t n, DataType dtype);
+
+    // dst = max(src, 0)
+    void launch_relu(void *dst, const void *src, size_t n, DataType dtype);
+
+    // dst = input > 0 ? grad : 0
+    void launch_relu_backward(void *dst, const void *grad, const void *input,
+                              size_t n, DataType dtype);
 
     void launch_scale(void *dst, const void *src, double factor, size_t n, DataType dtype);
 

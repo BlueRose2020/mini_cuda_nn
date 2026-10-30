@@ -1,120 +1,5 @@
 // Tensor 单元测试：构造、元数据、视图、reshape、clone、设备迁移
-#include "mini_cuda_nn/core/tensor.h"
-
-#include <cstdio>
-#include <initializer_list>
-#include <string>
-#include <vector>
-
-namespace
-{
-    int g_checks = 0;
-    int g_failures = 0;
-
-    void fail(const char *file, int line, const std::string &msg)
-    {
-        std::printf("    [FAIL] %s:%d  %s\n", file, line, msg.c_str());
-        ++g_failures;
-    }
-
-    void check_true(bool cond, const char *expr, const char *file, int line)
-    {
-        ++g_checks;
-        if (!cond)
-            fail(file, line, std::string("expected true: ") + expr);
-    }
-
-    void check_shape(const mcn::Tensor &t, std::vector<size_t> expect, const char *file, int line)
-    {
-        ++g_checks;
-        if (t.shape() != expect)
-            fail(file, line, "shape " + mcn::format_shape(t.shape()) +
-                                 " != expected " + mcn::format_shape(expect));
-    }
-
-    void check_numel(const mcn::Tensor &t, size_t expect, const char *file, int line)
-    {
-        ++g_checks;
-        if (t.numel() != expect)
-            fail(file, line, "numel " + std::to_string(t.numel()) +
-                                 " != expected " + std::to_string(expect));
-    }
-
-    void check_float(float got, float expect, float eps, const char *file, int line)
-    {
-        ++g_checks;
-        const float diff = got > expect ? got - expect : expect - got;
-        if (!(diff <= eps))
-            fail(file, line, "value " + std::to_string(got) +
-                                 " != expected " + std::to_string(expect));
-    }
-
-    void check_int(long long got, long long expect, const char *file, int line)
-    {
-        ++g_checks;
-        if (got != expect)
-            fail(file, line, "value " + std::to_string(got) +
-                                 " != expected " + std::to_string(expect));
-    }
-
-    void check_dtype(const mcn::Tensor &t, mcn::DataType expect, const char *file, int line)
-    {
-        ++g_checks;
-        if (t.dtype() != expect)
-            fail(file, line, std::string("dtype ") + mcn::dtype_to_string(t.dtype()) +
-                                 " != expected " + mcn::dtype_to_string(expect));
-    }
-
-    void check_device(const mcn::Tensor &t, mcn::Device expect, const char *file, int line)
-    {
-        ++g_checks;
-        const bool ok = (t.device() == expect);
-        if (!ok)
-            fail(file, line, std::string("device mismatch"));
-    }
-
-    // 按索引逐层取子张量，再从标量张量读值。
-    // 只能用于 CPU 张量（设备内存不能直接解引用）。
-    template <typename T>
-    T value_at(const mcn::Tensor &t, std::initializer_list<size_t> idx)
-    {
-        mcn::Tensor cur = t; // 深拷贝，安全（也顺带覆盖拷贝构造）
-        for (size_t i : idx)
-            cur = cur[i];
-        return *static_cast<const T *>(cur.data_ptr());
-    }
-
-    float f_at(const mcn::Tensor &t, std::initializer_list<size_t> idx)
-    {
-        return value_at<float>(t, idx);
-    }
-
-    int i_at(const mcn::Tensor &t, std::initializer_list<size_t> idx)
-    {
-        return value_at<int>(t, idx);
-    }
-}
-
-#define CHECK_TRUE(expr) ::check_true((expr), #expr, __FILE__, __LINE__)
-#define CHECK_SHAPE(t, ...) ::check_shape((t), std::vector<size_t>{__VA_ARGS__}, __FILE__, __LINE__)
-#define CHECK_NUMEL(t, n) ::check_numel((t), (n), __FILE__, __LINE__)
-#define CHECK_FLOAT(got, expect, eps) ::check_float((got), (expect), (eps), __FILE__, __LINE__)
-#define CHECK_FLOAT_EQ(got, expect) ::check_float((got), (expect), 1e-6f, __FILE__, __LINE__)
-#define CHECK_INT(got, expect) ::check_int((got), (expect), __FILE__, __LINE__)
-#define CHECK_DTYPE(t, d) ::check_dtype((t), (d), __FILE__, __LINE__)
-#define CHECK_DEVICE(t, d) ::check_device((t), (d), __FILE__, __LINE__)
-
-namespace
-{
-    float grad_at(const mcn::Tensor &leaf, std::initializer_list<size_t> idx)
-    {
-        const mcn::Tensor *g = leaf.grad();
-        CHECK_TRUE(g != nullptr);
-        if (!g)
-            return 0.f;
-        return f_at(*g, idx);
-    }
-}
+#include "test_common.h"
 
 namespace
 {
@@ -295,6 +180,51 @@ namespace
         CHECK_SHAPE(v, 2);
         CHECK_FLOAT_EQ(f_at(v, {0}), 3.f);
         CHECK_FLOAT_EQ(f_at(v, {1}), 4.f);
+    }
+
+    void test_copy_semantics()
+    {
+        std::puts("  test_copy_semantics");
+
+        mcn::Tensor a({1.f, 2.f, 3.f});
+
+        // 拷贝构造 = 浅拷贝：只是同一块存储的另一个句柄
+        mcn::Tensor b = a;
+        CHECK_SHAPE(b, 3);
+        CHECK_FLOAT_EQ(f_at(b, {1}), 2.f);
+        static_cast<float *>(b.data_ptr())[1] = 20.f;
+        CHECK_FLOAT_EQ(f_at(a, {1}), 20.f);
+
+        // 拷贝赋值同样是浅拷贝（与拷贝构造一致）
+        mcn::Tensor c;
+        c = a;
+        static_cast<float *>(c.data_ptr())[2] = 30.f;
+        CHECK_FLOAT_EQ(f_at(a, {2}), 30.f);
+
+        // clone 仍然是深拷贝
+        mcn::Tensor d = a.clone();
+        static_cast<float *>(d.data_ptr())[0] = 99.f;
+        CHECK_FLOAT_EQ(f_at(a, {0}), 1.f);
+        CHECK_FLOAT_EQ(f_at(d, {0}), 99.f);
+
+        // 浅拷贝保留 offset_：拷贝一个视图，仍指向原存储的同一位置
+        mcn::Tensor m({{1.f, 2.f}, {3.f, 4.f}});
+        mcn::Tensor row = m[1];
+        CHECK_FLOAT_EQ(f_at(row, {0}), 3.f);
+        static_cast<float *>(row.data_ptr())[0] = 33.f;
+        CHECK_FLOAT_EQ(f_at(m, {1, 0}), 33.f);
+
+        // clone 视图则物化成独立连续副本
+        mcn::Tensor m2({{1.f, 2.f}, {3.f, 4.f}});
+        mcn::Tensor rc = m2[1].clone();
+        static_cast<float *>(rc.data_ptr())[0] = 77.f;
+        CHECK_FLOAT_EQ(f_at(m2, {1, 0}), 3.f);
+
+        // 拷贝共享自动微分元数据：指向同一个节点
+        mcn::Tensor x({2.f, 3.f}, mcn::Device::CPU, mcn::DataType::FLOAT32, true);
+        mcn::Tensor y = x * x;
+        mcn::Tensor y2 = y;
+        CHECK_TRUE(y2.grad_fn() == y.grad_fn());
     }
 
     // ---------------- 填充 / 原地操作 ----------------
@@ -1345,6 +1275,7 @@ int main()
     test_view();
     test_reshape();
     test_clone();
+    test_copy_semantics();
     test_zeros_ones();
     test_fill();
     test_copy();
@@ -1372,6 +1303,6 @@ int main()
     test_cuda_binary();
     test_cuda_matmul();
 
-    std::printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
-    return g_failures == 0 ? 0 : 1;
+    std::printf("\n%d checks, %d failure(s)\n", mcn_test::g_checks, mcn_test::g_failures);
+    return mcn_test::g_failures == 0 ? 0 : 1;
 }

@@ -3,7 +3,10 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "dtype.h"
+#include "mini_cuda_nn/core/dtype.h"
+
+// 实现细节，不属于公开 API：只在 .cpp / .cu 里把 DataType 派发成模板参数。
+// 用户不需要知道它存在。
 
 namespace mcn::detail
 {
@@ -25,4 +28,4 @@ namespace mcn::detail
             std::abort();
         }
     }
-}
+} // namespace mcn::detail

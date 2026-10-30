@@ -137,7 +137,10 @@ namespace mcn
         }
         Tensor(const std::vector<size_t> &shape, const void *data, Device device = Device::CPU,
                DataType dtype = DataType::FLOAT32, bool require_grad = false);
-        Tensor(const Tensor &other);
+        // 浅拷贝：新 Tensor 只是同一块存储的另一个句柄（data_ 引用计数 +1），
+        // 与 operator= 语义一致。修改其中一个会影响到另一个。
+        // 需要独立副本请显式调用 clone()（深拷贝）。
+        Tensor(const Tensor &other) = default;
         Tensor(Tensor &&other) noexcept = default;
         ~Tensor();
 
@@ -181,8 +184,6 @@ namespace mcn
         MCN_UNUSED_EXPRESSION
         Tensor operator*(const Tensor &other) const;
 
-        // 标量乘：只改变数值，不改变 dtype（对标量做 static_cast）。
-        // 非模板入口放在 .cpp，模板只在 header 里把它转发一下。
         MCN_UNUSED_RETURN(mul_scalar)
         Tensor mul_scalar(double factor) const;
         template <typename T>
@@ -194,13 +195,20 @@ namespace mcn
             return mul_scalar(static_cast<double>(scalar));
         }
 
-        // 一元取负：-x
         MCN_UNUSED_RETURN(neg)
         Tensor neg() const;
         MCN_UNUSED_EXPRESSION
         Tensor operator-() const;
 
-        // 矩阵乘法：2D @ 2D、1D @ 2D、2D @ 1D、1D @ 1D
+        // ReLU：max(x, 0)。x == 0 处的导数取 0
+        MCN_UNUSED_RETURN(relu)
+        Tensor relu() const;
+
+        // 内部使用：dx = grad * (this > 0)。供 ReLU 的反向节点复用 kernel，
+        // 不做形状/设备校验（调用方保证）；grad 必须与 this 同形状同设备。
+        MCN_UNUSED_RETURN(relu_grad)
+        Tensor relu_grad(const Tensor &grad) const;
+
         MCN_UNUSED_RETURN(matmul)
         Tensor matmul(const Tensor &other) const;
 
@@ -270,6 +278,8 @@ namespace mcn
         DataType dtype() const { return dtype_; };
         size_t numel() const { return size_; };
         size_t ndim() const { return shape_.size(); };
+        // 是否连续布局（广播视图、transpose 出来的张量都不是）
+        bool is_contiguous() const;;
 
         // 数据访问
         void *data_ptr() { return byte_ptr(0); }
@@ -288,7 +298,16 @@ namespace mcn
         // 非原地：返回副本，原张量不变
         MCN_UNUSED_RETURN(to)
         Tensor to(Device device) const;
+        // 深拷贝：新存储 + 物化数据（视图会被压平，offset_ 归 0）
+        MCN_UNUSED_RETURN(clone)
         Tensor clone() const;
+
+        // 断开计算图：返回共享同一块存储、但 require_grad=false 的视图。
+        // 用于把“只当数据用”的张量（如 loss 的 target）排除在图之外。
+        MCN_UNUSED_RETURN(detach)
+        Tensor detach() const;
+        // 读出单元素张量的数值（CUDA 张量会触发一次 D2H 拷贝）
+        double item() const;
 
     private:
         void calculate_size();
@@ -301,7 +320,6 @@ namespace mcn
         void calculate_strides();
         void *byte_ptr(size_t elem) const;
         size_t view_offset(size_t linear) const;
-        bool is_contiguous() const;
         Tensor make_view() const;
         void check_inplace(const char *who) const;
 

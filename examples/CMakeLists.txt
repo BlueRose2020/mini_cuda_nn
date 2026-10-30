@@ -37,3 +37,13 @@ foreach(src IN LISTS EXAMPLE_SOURCES)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
 endforeach()
+
+# 子目录示例：多文件程序各自写 CMakeLists.txt，这里自动接入。
+# 例如 examples/dqn_snake/。同样 CONFIGURE_DEPENDS，新增目录会自动生效。
+file(GLOB EXAMPLE_SUBDIRS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/*/CMakeLists.txt"
+)
+foreach(sub_cmake IN LISTS EXAMPLE_SUBDIRS)
+    get_filename_component(sub_dir "${sub_cmake}" DIRECTORY)
+    add_subdirectory("${sub_dir}")
+endforeach()
